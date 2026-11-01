@@ -1,0 +1,13 @@
+# Optional host Nginx when WEB_BIND=127.0.0.1 in deploy/.env.
+# Add HTTPS with your existing certificate/reverse proxy before using the edit code.
+server {
+    listen 80;
+    server_name hong.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8082;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 900s;
+    }
+}

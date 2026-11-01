@@ -1,0 +1,35 @@
+name: hong-web
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      APP_MODE: web
+      AUTO_SYNC_ENABLED: "true"
+      WEB_ALLOW_PUBLIC_EDITS: "${WEB_ALLOW_PUBLIC_EDITS:-true}"
+    restart: unless-stopped
+    init: true
+    expose:
+      - "8000"
+    stop_grace_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8082}:8080"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
