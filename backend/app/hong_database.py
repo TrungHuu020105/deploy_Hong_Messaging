@@ -143,6 +143,10 @@ class MySQLConnection:
         except pymysql.MySQLError as error:
             code = error.args[0] if error.args else "unknown"
             raise ConnectionError(f"Không kết nối được MySQL (mã {code}). Kiểm tra 5 biến MYSQL_* và database đã được tạo.") from None
+        server_info = str(self.raw.get_server_info())
+        version = re.match(r"(\d+)\.(\d+)\.(\d+)",server_info)
+        self.row_alias_upsert = ("mariadb" not in server_info.lower() and version is not None
+                                 and tuple(map(int,version.groups())) >= (8,0,19))
         if initialize:
             try:
                 self.initialize_schema()
@@ -245,6 +249,11 @@ def begin_write(db):
 
 
 def upsert(db,table,values,keys,updates):
+    sql,params = upsert_query(db,table,values,keys,updates)
+    return db.execute(sql,params)
+
+
+def upsert_query(db,table,values,keys,updates):
     cols = list(values)
     sql = f"INSERT INTO {identifier(table)} ({','.join(map(identifier,cols))}) VALUES ({','.join('?' for _ in cols)})"
     params = list(values.values())
@@ -254,7 +263,24 @@ def upsert(db,table,values,keys,updates):
     else:
         sql += f" ON CONFLICT({','.join(map(identifier,keys))}) DO UPDATE SET "+",".join(
             f"{identifier(col)}=excluded.{identifier(col)}" for col in updates)
-    return db.execute(sql,params)
+    return sql,params
+
+
+def upsert_many(db,table,rows,keys,updates):
+    rows = list(rows)
+    if not rows:
+        return
+    columns = list(rows[0])
+    if is_mysql(db):
+        values = ",".join("("+",".join("?" for _ in columns)+")" for _ in rows)
+        sql = f"INSERT INTO {identifier(table)} ({','.join(map(identifier,columns))}) VALUES {values}"
+        if getattr(db,"row_alias_upsert",True):
+            sql += " AS incoming ON DUPLICATE KEY UPDATE "+",".join(f"{identifier(col)}=incoming.{identifier(col)}" for col in updates)
+        else:
+            sql += " ON DUPLICATE KEY UPDATE "+",".join(f"{identifier(col)}=VALUES({identifier(col)})" for col in updates)
+        return db.execute(sql,[row[col] for row in rows for col in columns])
+    sql,_ = upsert_query(db,table,rows[0],keys,updates)
+    return db.executemany(sql,[[row[col] for col in columns] for row in rows])
 
 
 def insert_if_absent(db,table,values,keys):

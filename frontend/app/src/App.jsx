@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 const API = '/api';
 const WEB_BUILD = import.meta.env.VITE_APP_MODE === 'web';
@@ -11,8 +11,22 @@ async function request(path, options = {}) {
     ...options,
     headers: { 'Content-Type': 'application/json', ...(editorCredential?{Authorization:`Bearer ${editorCredential}`} : {}), ...(options.headers || {}) },
   });
-  const result = await response.json();
-  if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Yêu cầu chưa thực hiện được.');
+  if (path==='/dashboard'&&response.status===404) {
+    await response.text();
+    throw new Error('Backend đang chạy bản cũ. Khởi động lại backend sau khi cập nhật giao diện.');
+  }
+  return readApiResponse(response);
+}
+
+async function readApiResponse(response) {
+  const body = await response.text();
+  let result;
+  try { result = JSON.parse(body); }
+  catch {
+    if (body.trim()==='Invalid host header') throw new Error('Máy chủ chưa cho phép IP hoặc tên miền này. Cần cập nhật ALLOWED_HOSTS trên máy chạy backend.');
+    throw new Error(`Máy chủ chưa trả về dữ liệu hợp lệ (HTTP ${response.status}). Kiểm tra backend và kết nối database.`);
+  }
+  if (!response.ok) throw new Error(typeof result?.detail === 'string' ? result.detail : 'Yêu cầu chưa thực hiện được.');
   return result;
 }
 
@@ -183,9 +197,14 @@ function App() {
   const [editorDialog,setEditorDialog] = useState(false);
   const [editorCode,setEditorCode] = useState('');
   const [editorError,setEditorError] = useState('');
+  const refreshInFlight = useRef(null);
+  const scheduleDirtyRef = useRef(scheduleDirty);
+  scheduleDirtyRef.current = scheduleDirty;
   const isWeb = WEB_BUILD || config?.mode==='web';
   const canEdit = !isWeb || (!!config?.capabilities?.editing && (!config.capabilities.editing_auth_required || editorUnlocked));
   const visibleNav = isWeb ? [...nav.filter(item=>item.id!=='schedule'),{id:'sync',label:'Đồng bộ đơn hàng',icon:'refresh'}] : nav;
+  const priceOnly = config?.data_scope==='price_passed';
+  useEffect(()=>{if(priceOnly){setPriceFilter('all');setReasonFilter('all');}},[priceOnly]);
 
   async function unlockEditor(e) {
     e.preventDefault(); setBusy('editor'); setEditorError('');
@@ -196,14 +215,15 @@ function App() {
     finally { setBusy(''); }
   }
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback((force=false) => {
+    if (refreshInFlight.current) {
+      return force===true ? refreshInFlight.current.then(()=>refresh(true)) : refreshInFlight.current;
+    }
+    const work = (async()=>{
     try {
-      const [o, c, u, m, j] = await Promise.all([
-        request('/overview'), request('/config'), request('/customers?include_excluded=true'),
-        request('/messages'), request('/jobs'),
-      ]);
-      setOverview(o); setConfig(c); setCustomers(u.items);
-      setMessages(m.items); setJobs(j.items); if (!scheduleDirty) setSchedule(c.schedule);
+      const {overview:o,config:c,customers:u,messages:m,jobs:j} = await request('/dashboard');
+      setOverview(o); setConfig(c); setCustomers(u);
+      setMessages(m); setJobs(j); if (!scheduleDirtyRef.current) setSchedule(c.schedule);
       if (!syncStart) {
         const d = new Date(`${c.today}T12:00:00Z`);
         d.setUTCDate(d.getUTCDate() - 15);
@@ -211,13 +231,17 @@ function App() {
         setSyncStart(previous); setSyncEnd(c.today);
       }
     } catch (error) { setNotice({ error: true, text: error.message }); }
+    })();
+    refreshInFlight.current = work;
+    work.finally(()=>{if(refreshInFlight.current===work)refreshInFlight.current=null;});
+    return work;
   }, [syncStart, scheduleDirty]);
 
   useEffect(() => { refresh(); const timer = setInterval(refresh, 20000); return () => clearInterval(timer); }, [refresh]);
 
   async function act(label, fn, success) {
     setBusy(label);
-    try { const result = await fn(); setNotice({ text: success || 'Đã cập nhật.' }); await refresh(); return result; }
+    try { const result = await fn(); setNotice({ text: success || 'Đã cập nhật.' }); await refresh(true); return result; }
     catch (error) { setNotice({ error: true, text: error.message }); return null; }
     finally { setBusy(''); }
   }
@@ -300,14 +324,14 @@ function App() {
         <div className="hero"><div><span className="hero-kicker">KHÔNG GIAN CHĂM SÓC KHÁCH HÀNG</span><h1>Khách hàng sau mua</h1><p>Theo dõi hành trình sau khi khách nhận mắc ca. Chọn đúng thời điểm để hỏi thăm và chăm sóc.</p><button className="hero-button" onClick={()=>{setPage('customers');setCustomerFilter('not_sent');}}>Xem khách chưa nhắn <Icon name="chevron" size={17}/></button></div><div className="hero-art" aria-hidden="true"><div className="nut nut-one"/><div className="nut nut-two"/><div className="nut nut-three"/><div className="hero-orbit orbit-one"/><div className="hero-orbit orbit-two"/></div></div>
         <div className="stat-grid"><Stat label="Khách đủ điều kiện" value={number(overview?.total_customers ?? 0)} icon="users" tone="forest" note="Trong 15 ngày sau nhận"/><Stat label="Chưa nhắn" value={number((overview?.message_states?.not_sent || 0)+(overview?.message_states?.pending || 0))} icon="chat" tone="gold" note={isWeb?'Theo dõi khách chưa nhắn':'Có thể lên lịch chăm sóc'}/><Stat label="Đã nhắn" value={number(overview?.message_states?.sent || 0)} icon="check" tone="blue" note="Đã thử gửi hoặc xác nhận"/><Stat label="Giá trị đơn" value={number((overview?.total_amount || 0)/1000000,1)} suffix="tr ₫" icon="box" tone="rose" note="Tổng đơn đủ điều kiện"/></div>
         <div className="panel day-panel"><SectionHead eyebrow="THEO THỜI GIAN" title="Số khách theo ngày nhận" subtitle="Tính theo ngày Việt Nam; đơn quá 15 ngày được tự xóa nếu khách chưa có thẻ." right={<span className="mini-tag">Ngày nhận → 15 ngày</span>}/><div className="day-grid">{(overview?.days || Array.from({length:15},(_,i)=>({day:i+1,count:0}))).map(d=>{const max=Math.max(1,...(overview?.days||[]).map(x=>x.count));return <button title={`${d.count} khách ở ngày ${d.day}`} onClick={()=>{setDayFilter(d.day);setPage('customers');setCustomerFilter('all');setPriceFilter('eligible');setReasonFilter('all');setSearch('');}} className={`day-card ${d.count?'has-customers':''}`} key={d.day}><strong>{String(d.day).padStart(2,'0')}</strong><div className="day-bar"><i style={{height:`${Math.max(8,d.count/max*100)}%`}}/></div><b>{number(d.count)}</b><small>khách</small></button>})}</div><div className="day-note"><span>Ngày 0: {number(overview?.day_zero || 0)} khách vừa nhận</span><span>Mỗi khách được tính theo đơn đủ điều kiện gần nhất</span></div></div>
-        <div className="two-col"><div className="panel"><SectionHead eyebrow="BẢNG GIÁ" title="Mắc ca nứt vỏ" subtitle="Giá nghìn đồng/kg · mốc khối lượng gần nhất thấp hơn"/><PriceTable config={config}/><div className="price-note">HG & TZ: giá HN + 10% · Chỉ chọn đơn có giá bán cao hơn bảng</div></div><div className="panel quick-panel"><SectionHead eyebrow="THAO TÁC NHANH" title="Bắt đầu từ đây"/><button onClick={()=>setPage('customers')}><span className="quick-icon"><Icon name="users"/></span><span><strong>Xem danh sách khách</strong><small>Đơn, SKU, kg và trạng thái nhắn</small></span><Icon name="chevron" size={17}/></button><button onClick={()=>setPage(isWeb?'sync':'schedule')}><span className="quick-icon"><Icon name={isWeb?'refresh':'clock'}/></span><span><strong>{isWeb?'Đồng bộ đơn hàng':'Thiết lập lịch gửi'}</strong><small>{isWeb?'Theo dõi dữ liệu Pancake POS':'Ví dụ 3 giờ gửi thêm 10 khách'}</small></span><Icon name="chevron" size={17}/></button><button onClick={()=>{setPage('customers');setPriceFilter('excluded');setReasonFilter('all');}}><span className="quick-icon"><Icon name="filter"/></span><span><strong>Kiểm tra giá đơn</strong><small>Xem điều kiện chọn hoặc lý do loại</small></span><Icon name="chevron" size={17}/></button></div></div>
+        <div className="two-col"><div className="panel"><SectionHead eyebrow="BẢNG GIÁ" title="Mắc ca nứt vỏ" subtitle="Giá nghìn đồng/kg · mốc khối lượng gần nhất thấp hơn"/><PriceTable config={config}/><div className="price-note">HG & TZ: giá HN + 10% · Chỉ chọn đơn có giá bán cao hơn bảng</div></div><div className="panel quick-panel"><SectionHead eyebrow="THAO TÁC NHANH" title="Bắt đầu từ đây"/><button onClick={()=>setPage('customers')}><span className="quick-icon"><Icon name="users"/></span><span><strong>Xem danh sách khách</strong><small>Đơn, SKU, kg và trạng thái nhắn</small></span><Icon name="chevron" size={17}/></button><button onClick={()=>setPage(isWeb?'sync':'schedule')}><span className="quick-icon"><Icon name={isWeb?'refresh':'clock'}/></span><span><strong>{isWeb?'Đồng bộ đơn hàng':'Thiết lập lịch gửi'}</strong><small>{isWeb?'Theo dõi dữ liệu Pancake POS':'Ví dụ 3 giờ gửi thêm 10 khách'}</small></span><Icon name="chevron" size={17}/></button><button onClick={()=>{setPage('customers');setPriceFilter(priceOnly?'all':'excluded');setReasonFilter('all');}}><span className="quick-icon"><Icon name="filter"/></span><span><strong>{priceOnly?'Xem đơn đạt giá':'Kiểm tra giá đơn'}</strong><small>{priceOnly?'Danh sách chỉ gồm đơn đã đạt giá':'Xem điều kiện chọn hoặc lý do loại'}</small></span><Icon name="chevron" size={17}/></button></div></div>
       </>}
 
       {page==='customers' && <>
         <div className="page-intro">
           <div className="eyebrow">DANH SÁCH CHĂM SÓC</div>
           <h1>Khách hàng</h1>
-          <p>Xem đơn mắc ca, giá bảng và lý do loại trong 15 ngày sau khi nhận hàng.</p>
+          <p>Xem các đơn mắc ca đạt giá; hồ sơ có thẻ được lưu lâu hơn 15 ngày.</p>
         </div>
         <div className="panel">
           <div className="table-toolbar customer-toolbar">
@@ -315,38 +339,44 @@ function App() {
               {[['all','Tất cả'],['not_sent','Chưa nhắn'],['sent','Đã nhắn'],['needs_review','Cần đối chiếu']].map(([value,label])=><button key={value} onClick={()=>setCustomerFilter(value)} className={customerFilter===value?'chosen':''}>{label}</button>)}
             </div>
             <div className="customer-filter-row">
-              <label className="filter-select">Giá bán
+              {!priceOnly&&<label className="filter-select">Giá bán
                 <select value={priceFilter} onChange={e=>{setPriceFilter(e.target.value);setReasonFilter('all');}}>
                   <option value="all">Tất cả</option><option value="eligible">Có đơn đạt giá</option><option value="excluded">Không đạt giá</option>
                 </select>
-              </label>
+              </label>}
               <label className="filter-select">Ngày nhận gần nhất
                 <select value={dayFilter ?? 'all'} onChange={e=>setDayFilter(e.target.value==='all'?null:Number(e.target.value))}>
                   <option value="all">Tất cả ngày</option>{Array.from({length:16},(_,day)=><option key={day} value={day}>Ngày {day}</option>)}
                 </select>
               </label>
-              <label className="filter-select">Lý do loại
+              {!priceOnly&&<label className="filter-select">Lý do loại
                 <select value={reasonFilter} onChange={e=>setReasonFilter(e.target.value)}>
                   <option value="all">Tất cả lý do</option>
                   {['below_price','other_nut','missing_line_price','missing_amount','unknown_weight','packaging','no_macadamia'].map(code=><option key={code} value={code}>{config?.reasons?.[code] || code}</option>)}
                 </select>
-              </label>
+              </label>}
               <label className="filter-select">Thẻ<select value={tagFilter} onChange={e=>setTagFilter(e.target.value)}><option value="all">Tất cả thẻ</option>{knownTags.map(tag=><option key={tag} value={`tag:${tag}`}>{tag}</option>)}</select></label>
               <label className="search-box"><Icon name="search" size={17}/><input placeholder="Tìm khách, thẻ, SKU, mã đơn..." value={search} onChange={e=>setSearch(e.target.value)}/></label>
               {!isWeb&&<button className="outline-btn" onClick={()=>showPreview(previewRecipients)} disabled={!!busy||!previewRecipients.length}><Icon name="send" size={16}/>Xem trước tin nhắn {selectedValid.length?`(${selectedValid.length})`:''}</button>}
             </div>
           </div>
           <div className="table-hint">Vuốt ngang để xem giá bảng và trạng thái tin nhắn.</div>
-          <div className="table-scroll customer-table-wrap"><table className="data-table customer-table"><thead><tr>
+          <div className="table-scroll customer-table-wrap"><table className={`data-table customer-table ${isWeb?'customer-table-web':'customer-table-admin'}`}>
+            <colgroup>
+              {!isWeb&&<col className="customer-select-col"/>}
+              <col className="customer-name-col"/><col className="customer-received-col"/>
+              <col className="customer-orders-col"/><col className="customer-weight-col"/>
+              <col className="customer-value-col"/><col className="customer-price-col"/><col className="customer-message-col"/>
+            </colgroup><thead><tr>
             {!isWeb&&<th className="check-col"><input type="checkbox" aria-label="Chọn khách đủ điều kiện chưa nhắn trong trang này" checked={pageSendable.length>0&&pageSendable.every(c=>selectedSet.has(c.username))} onChange={e=>setSelected(current=>e.target.checked?[...new Set([...current,...pageSendable.map(c=>c.username)])]:current.filter(u=>!pageSendable.some(c=>c.username===u)))}/></th>}
-            <th>KHÁCH HÀNG</th><th>NGÀY NHẬN</th><th>ĐƠN HÀNG / SKU</th><th>KHỐI LƯỢNG</th><th>GIÁ TRỊ MUA</th><th>GIÁ BẢNG<small className="subline">Đơn gần nhất</small></th><th>TIN NHẮN</th>
+            <th scope="col" className="customer-name-cell">KHÁCH HÀNG</th><th scope="col" className="customer-received-cell">NGÀY NHẬN</th><th>ĐƠN HÀNG / SKU</th><th>KHỐI LƯỢNG</th><th>GIÁ TRỊ MUA</th><th>GIÁ BẢNG<small className="subline">Đơn gần nhất</small></th><th>TIN NHẮN</th>
           </tr></thead><tbody>{pagedCustomers.map(c=>{
             const latest=c.orders[0];
             const sendable=eligibleUnsent.some(item=>item.key===c.key);
             return <tr className="customer-row" key={c.key} tabIndex={0} role="button" aria-label={`Xem tất cả đơn của ${c.username||c.display_name||'khách hàng'}`} onClick={()=>setDetailCustomer(c)} onKeyDown={e=>{if(e.target===e.currentTarget&&(e.key==='Enter'||e.key===' ')){e.preventDefault();setDetailCustomer(c);}}}>
               {!isWeb&&<td onClick={e=>e.stopPropagation()}><input type="checkbox" disabled={!sendable} checked={selectedSet.has(c.username)} onChange={()=>toggleSelect(c.username)} aria-label={`Chọn ${c.username||'khách hàng'}`}/></td>}
-              <td><div className="person"><span className="person-avatar">{(c.username||'?').slice(0,2).toUpperCase()}</span><span><strong>{c.username?`@${c.username}`:'Chưa rõ tài khoản'}</strong><small>{c.latest_order_id?`#${c.latest_order_id}`:"Chưa có đơn"}</small><span className="customer-tags table-tags">{(c.tags||[]).map(tag=><span className="customer-tag" key={tag}>{tag}</span>)}</span></span></div></td>
-              <td><strong className="day-number">Ngày {c.age_days}</strong><small className="subline">{c.received_date||'—'}</small></td>
+              <td className="customer-name-cell"><div className="person"><span className="person-avatar">{(c.username||'?').slice(0,2).toUpperCase()}</span><span className="person-copy"><strong title={c.username?`@${c.username}`:'Chưa rõ tài khoản'}>{c.username?`@${c.username}`:'Chưa rõ tài khoản'}</strong><small title={c.latest_order_id?`#${c.latest_order_id}`:''}>{c.latest_order_id?`#${c.latest_order_id}`:"Chưa có đơn"}</small><span className="customer-tags table-tags">{(c.tags||[]).map(tag=><span className="customer-tag" key={tag}>{tag}</span>)}</span></span></div></td>
+              <td className="customer-received-cell"><strong className="day-number">{c.age_days==null?'—':`Ngày ${c.age_days}`}</strong><small className="subline">{c.received_date||'—'}</small></td>
               <td><strong>{c.orders.length} đơn</strong><small className="subline sku-line">{latest?.items.filter(i=>i.grade).map(i=>i.sku).join(', ')||latest?.items.map(i=>i.sku).join(', ')||'—'}</small></td>
               <td><strong>{number(c.total_kg,2)} kg</strong><small className="subline">{number(c.units_500g,1)} × 500 g mắc ca</small></td>
               <td className="amount">{money(c.total_amount)}<small className="subline">Tổng {c.orders.length} đơn</small></td>
@@ -367,7 +397,7 @@ function App() {
     {editorDialog&&<div className="modal-backdrop"><form className="modal review-modal" onSubmit={unlockEditor}><div className="modal-head"><div><div className="eyebrow">QUYỀN CHỈNH SỬA</div><h2>Mở quyền chỉnh sửa</h2></div><button type="button" className="icon-button" aria-label="Đóng" onClick={()=>{setEditorDialog(false);setEditorCode('');}}><Icon name="close"/></button></div><p className="modal-intro">Nhập mã quản trị để gắn thẻ, lưu hồ sơ, xóa đơn hoặc đồng bộ thủ công.</p><label className="review-label">Mã quản trị<input className="editor-code-input" type="password" autoComplete="off" autoFocus value={editorCode} onChange={e=>setEditorCode(e.target.value)}/></label>{editorError&&<p className="profile-error" role="alert">{editorError}</p>}<div className="modal-actions"><button className="primary-btn" disabled={!!busy||!editorCode}>Mở quyền chỉnh sửa</button></div></form></div>}
 
     {detailCustomer && <CustomerProfile key={detailCustomer.key} customer={detailCustomer} config={config} knownTags={knownTags} canEdit={canEdit}
-      onClose={()=>setDetailCustomer(null)} onSaved={()=>{setDetailCustomer(null);setNotice({text:'Đã lưu hồ sơ khách hàng.'});refresh();}}/>}
+      onClose={()=>setDetailCustomer(null)} onSaved={()=>{setDetailCustomer(null);setNotice({text:'Đã lưu hồ sơ khách hàng.'});refresh(true);}}/>}
 
     {!isWeb && preview && <div className="modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)setPreview(null);}}><div className="modal"><div className="modal-head"><div><div className="eyebrow">KIỂM TRA TRƯỚC KHI GỬI</div><h2>Xem trước tin nhắn</h2></div><button className="icon-button" onClick={()=>setPreview(null)}><Icon name="close"/></button></div><p className="modal-intro">{preview.length} khách · Tin sẽ dùng nội dung hỏi thăm mặc định. Kiểm tra đúng tài khoản nhận trước khi gửi.</p><div className="preview-list">{preview.map((p,i)=><div className="preview-item" key={`${p.username}-${i}`}><div className="preview-person"><strong>@{p.username}</strong><span>Ngày {p.age_days} · Đơn #{p.order_id} · {money(p.amount)}</span></div><p>{p.body}</p></div>)}{!preview.length&&<Empty title="Chưa có khách để gửi" description="Danh sách đã nhắn, cần đối chiếu hoặc không thuộc khoảng ngày đã chọn."/>}</div><div className="modal-actions"><button className="outline-btn" onClick={()=>setPreview(null)}>Đóng</button><button className="primary-btn" disabled={!preview.length||!browserReady||!!busy} onClick={sendPreview}><Icon name="send" size={17}/>Gửi {preview.length} khách</button></div>{!browserReady&&preview.length>0&&<div className="modal-hint">Mở Chrome và xác nhận tài khoản ở mục Lịch gửi tin để bật gửi thật.</div>}</div></div>}
 
@@ -375,5 +405,5 @@ function App() {
   </div>;
 }
 
-export { CustomerProfile };
+export { CustomerProfile, readApiResponse };
 export default App;

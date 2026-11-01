@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 import re
 import secrets
 from datetime import date, timedelta
@@ -105,8 +106,10 @@ def create_app(service: AppService | None = None, *, start_worker=True, mode=Non
     @asynccontextmanager
     async def lifespan(_app):
         if not service._db_initialized:
+            logging.getLogger("uvicorn.error").info("Connecting to database and preparing schema...")
             service.init_db()
         if start_worker:
+            logging.getLogger("uvicorn.error").info("Starting %s backend workers...",app_mode)
             service.start()
         else:
             service.purge_expired()
@@ -147,16 +150,29 @@ def create_app(service: AppService | None = None, *, start_worker=True, mode=Non
 
     @app.get("/api/config")
     def config():
-        return {"rules":service.get_rules(),"schedule":service.get_schedule() if app_mode == "admin" else None,
+        with service.db() as db:
+            return configuration(service.get_rules(db),service.get_schedule(db) if app_mode == "admin" else None)
+
+    def configuration(rules,schedule):
+        return {"rules":rules,"schedule":schedule if app_mode == "admin" else None,
                 "price_table":PRICE_TABLE,"tiers":TIERS,"grade_labels":GRADE_LABELS,
                 "reasons":REASONS,"today":today_vn().isoformat(),"sender_revision":SENDER_REVISION,
-                "mode":app_mode,"capabilities":{"sending":app_mode == "admin",
+                "mode":app_mode,"data_scope":"price_passed","capabilities":{"sending":app_mode == "admin",
                 "editing":app_mode == "admin" or bool(token) or public_edits,
                 "editing_auth_required":app_mode == "web" and not public_edits}}
 
+    @app.get("/api/dashboard")
+    def dashboard():
+        result = service.dashboard_data()
+        result["config"] = configuration(result.pop("rules"),result.pop("schedule"))
+        if app_mode == "web":
+            result["overview"].pop("schedule",None)
+            result["overview"].pop("browser",None)
+        return result
+
     @app.get("/api/overview")
     def overview():
-        result = service.overview()
+        result = service.overview(passing_only=True)
         if app_mode == "web":
             result.pop("schedule",None)
             result.pop("browser",None)
@@ -164,11 +180,11 @@ def create_app(service: AppService | None = None, *, start_worker=True, mode=Non
 
     @app.get("/api/orders")
     def orders(include_excluded:bool=True):
-        return {"items":service.orders(include_excluded=include_excluded)}
+        return {"items":service.orders(include_excluded=include_excluded,passing_only=True)}
 
     @app.get("/api/customers")
     def customers(include_excluded:bool=False):
-        return {"items":service.customers(include_excluded=include_excluded)}
+        return {"items":service.customers(include_excluded=include_excluded,passing_only=True)}
 
     @app.put("/api/customer-profile")
     def save_customer_profile(request:CustomerProfileRequest):

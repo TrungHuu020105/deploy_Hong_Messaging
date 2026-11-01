@@ -13,14 +13,14 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from backend.domain import GRADE_LABELS, PRICE_TABLE, REASONS, TIERS, evaluate_price, expand_items
+from backend.domain import GRADE_LABELS, PRICE_TABLE, REASONS, TIERS, evaluate_price, expand_items, price_rules_hash
 from hong_core import (ROOT, UTC, VN, DEFAULT_TEMPLATE, connect_db, fetch_orders,
                        ingest_orders, load_settings, normalize_order, now_iso,
                        prepare_messages, resolved_username, review_message, today_vn,
                        username_candidate)
 from hong_tiktok import TikTokSender, open_browser, run_queue
 from hong_database import (MYSQL_KEYS, begin_write, insert_if_absent, is_mysql,
-                           load_environment, mysql_settings, upsert)
+                           load_environment, mysql_settings, upsert, upsert_many)
 
 DEFAULT_RULES = {
     "prices": PRICE_TABLE, "packaging": ["HN", "HG", "TZ"],
@@ -72,6 +72,7 @@ class AppService:
         self.auto_sync_enabled = auto_sync_enabled
         self.auto_sync_error = None
         self._next_auto_sync_at = 0.0
+        self._next_schedule_poll = 0.0
         self._sync_lock = threading.Lock()
         self.driver = None
         self.account_checked = False
@@ -184,7 +185,9 @@ class AppService:
         self._lock_file()
         if self.mode == "admin":
             self._recover_send_jobs()
-        self.purge_expired()
+        # Maintenance is batched in the background; don't keep HTTP startup waiting
+        # for a full database sweep on a remote MySQL server.
+        self._last_purge = 0.0
         self._stop.clear()
         self._thread = threading.Thread(target=self._scheduler_loop,name="hong-scheduler",daemon=True)
         self._thread.start()
@@ -256,6 +259,7 @@ class AppService:
             schedule["next_run_at"] = None
         with self.db() as db,db:
             db.execute("UPDATE app_schedule SET payload=? WHERE id=1",(json.dumps(schedule,ensure_ascii=False),))
+        self._next_schedule_poll = 0.0
         return schedule
 
     def browser_ready(self):
@@ -330,25 +334,36 @@ class AppService:
 
     @staticmethod
     def _delete_order(db, shop_id, order_id):
-        args = (shop_id,order_id)
-        db.execute("""DELETE FROM message_events WHERE message_id IN
-            (SELECT id FROM messages WHERE shop_id=? AND order_id=?)""",args)
-        db.execute("DELETE FROM messages WHERE shop_id=? AND order_id=?",args)
-        db.execute("DELETE FROM sync_run_orders WHERE shop_id=? AND order_id=?",args)
-        db.execute("DELETE FROM orders WHERE shop_id=? AND order_id=?",args)
+        AppService._delete_orders(db,[(shop_id,order_id)])
 
-    def _clean_orphan_customers(self, db):
-        protected = {key for profile in self._profiles(db).values() for key in profile["customer_keys"]}
+    @staticmethod
+    def _delete_orders(db,keys):
+        for start in range(0,len(keys),200):
+            chunk = keys[start:start+200]
+            where = " OR ".join("(shop_id=? AND order_id=?)" for _ in chunk)
+            args = [value for pair in chunk for value in pair]
+            db.execute(f"DELETE FROM message_events WHERE message_id IN (SELECT id FROM messages WHERE {where})",args)
+            for table in ("messages","sync_run_orders","orders"):
+                db.execute(f"DELETE FROM {table} WHERE {where}",args)
+
+    def _clean_orphan_customers(self, db, profiles=None):
+        profiles = self._profiles(db) if profiles is None else profiles
+        protected = {key for profile in profiles.values() for key in profile["customer_keys"]}
         orphaned = db.execute("""SELECT * FROM customers c WHERE NOT EXISTS
             (SELECT 1 FROM orders o WHERE o.customer_key=c.customer_key)""").fetchall()
+        secret = bytes.fromhex(db.execute("SELECT value FROM app_meta WHERE `key`='secret'").fetchone()[0]) if any(c["opted_out"] for c in orphaned) else None
+        removed = []
         for customer in orphaned:
             if customer["customer_key"] in protected:
                 continue
             if customer["opted_out"]:
                 for username in {customer["username"],customer["username_candidate"]} - {None,""}:
                     insert_if_absent(db,"app_opt_out_hash",
-                        {"digest":self._hash_username(db,username),"created_at":now_iso()},["digest"])
-            db.execute("DELETE FROM customers WHERE customer_key=?",(customer["customer_key"],))
+                        {"digest":hmac.new(secret,username.casefold().encode("utf-8"),hashlib.sha256).hexdigest(),"created_at":now_iso()},["digest"])
+            removed.append(customer["customer_key"])
+        for start in range(0,len(removed),200):
+            chunk = removed[start:start+200]
+            db.execute("DELETE FROM customers WHERE customer_key IN ("+",".join("?" for _ in chunk)+")",chunk)
 
     def save_customer_profile(self, key, tags, delete_orders):
         clean_tags = []
@@ -366,8 +381,9 @@ class AppService:
                 raise ValueError("Đang chạy đợt gửi. Đợi hoàn tất trước khi xóa đơn.")
             begin_write(db)
             rows = []
+            contacts = {r["customer_key"]:dict(r) for r in db.execute("SELECT * FROM customers")}
             for row in db.execute("SELECT * FROM orders").fetchall():
-                snapshot = self._snapshot(db,row)
+                snapshot = self._snapshot(db,row,contacts=contacts,items_by_order={})
                 if self._profile_key({**dict(row),"username":snapshot["username"]}) == key:
                     rows.append((dict(row),snapshot))
             previous = self._profiles(db).get(key)
@@ -399,17 +415,19 @@ class AppService:
             self._clean_orphan_customers(db)
         return {"key":key,"tags":clean_tags,"deleted_orders":len(requested)}
 
-    def _snapshot(self, db, order):
+    def _snapshot(self, db, order, *, contacts=None, items_by_order=None):
         order = dict(order)
-        customer = db.execute("SELECT * FROM customers WHERE customer_key=?",(order["customer_key"],)).fetchone()
-        items = [dict(r) for r in db.execute("SELECT * FROM order_items WHERE shop_id=? AND order_id=? ORDER BY line_no",
-                                             (order["shop_id"],order["order_id"]))]
+        customer = (contacts.get(order["customer_key"]) if contacts is not None else
+                    db.execute("SELECT * FROM customers WHERE customer_key=?",(order["customer_key"],)).fetchone())
+        items = (items_by_order.get((order["shop_id"],order["order_id"]),[]) if items_by_order is not None else
+                 [dict(r) for r in db.execute("SELECT * FROM order_items WHERE shop_id=? AND order_id=? ORDER BY line_no",
+                                             (order["shop_id"],order["order_id"]))])
         raw = json.loads(order["raw_json"])
         user = resolved_username(customer,order) if customer else username_candidate(raw.get("bill_full_name"))
         return {"order":order,"customer":dict(customer) if customer else None,"raw":raw,
                 "username":user,"items":items}
 
-    def assess(self, db, snapshot, *, rules=None, today=None):
+    def assess(self, db, snapshot, *, rules=None, today=None, denied=None):
         rules = rules or self.get_rules(db)
         today = today or today_vn()
         order = snapshot["order"]
@@ -430,7 +448,7 @@ class AppService:
             reason = "expired"
         elif not snapshot["username"]:
             reason = "invalid_username"
-        elif snapshot["customer"] and snapshot["customer"]["opted_out"] or self._denied(db,snapshot["username"]):
+        elif (snapshot["customer"] and snapshot["customer"]["opted_out"]) or (self._denied(db,snapshot["username"]) if denied is None else denied):
             reason = "opted_out"
         return {**product,"price_eligible":product["eligible"],"price_reason":product["reason"],
                 "price_reason_label":REASONS.get(product["reason"],product["reason"]),
@@ -441,6 +459,10 @@ class AppService:
         if not username:
             return "not_sent"
         states = [r[0] for r in db.execute("SELECT state FROM messages WHERE LOWER(username)=LOWER(?) ORDER BY id DESC",(username,))]
+        return self._message_status(states)
+
+    @staticmethod
+    def _message_status(states):
         if any(s in {"submitted","sent"} for s in states):
             return "sent"
         if any(s in {"sending","uncertain"} for s in states):
@@ -451,38 +473,100 @@ class AppService:
             return "failed"
         return "not_sent"
 
-    def orders(self, *, include_excluded=True):
+    def orders(self, *, include_excluded=True, passing_only=False):
         with self.db() as db:
-            rules = self.get_rules(db)
-            today = today_vn()
-            rows = []
-            for order in db.execute("SELECT * FROM orders ORDER BY update_date DESC,order_id DESC").fetchall():
-                s = self._snapshot(db,order)
-                assessment = self.assess(db,s,rules=rules,today=today)
-                if not include_excluded and not assessment["eligible"]:
-                    continue
-                rows.append({"shop_id":order["shop_id"],"order_id":order["order_id"],
-                             "customer_key":order["customer_key"],"username":s["username"],
-                             "display_name":s["raw"].get("bill_full_name"),
-                             "phone":s["raw"].get("bill_phone_number"),"amount":order["amount"],
-                             "amount_source":order["amount_source"],"source":order["source"],
-                             "status":order["status"],"items":assessment["items"],
-                             "eligible":assessment["eligible"],"reason":assessment["reason"],
-                             "reason_label":assessment["reason_label"],"price_checks":assessment["price_checks"],
-                             "price_eligible":assessment["price_eligible"],
-                             "price_reason":assessment["price_reason"],
-                             "price_reason_label":assessment["price_reason_label"],
-                             "threshold_amount":assessment["threshold_amount"],
-                             "total_kg":assessment["total_kg"],"units_500g":assessment["units_500g"],
-                             "received_date":assessment["received_date"],"age_days":assessment["age_days"],
-                             "message_state":self._status_for_username(db,s["username"]),
-                             "opted_out":bool(s["customer"] and s["customer"]["opted_out"])})
-            return rows
+            return self._orders_from_db(db,include_excluded=include_excluded,passing_only=passing_only)
 
-    def customers(self, *, include_excluded=False):
-        orders = self.orders(include_excluded=True)
-        with self.db() as db:
-            profiles = self._profiles(db)
+    def _ensure_price_index(self,db,rules):
+        signature = price_rules_hash(rules)
+        join = "LEFT JOIN app_order_prices p ON p.shop_id=o.shop_id AND p.order_id=o.order_id"
+        stale = "(p.order_id IS NULL OR p.rules_hash!=?)"
+        if not db.execute(f"SELECT 1 FROM orders o {join} WHERE {stale} LIMIT 1",(signature,)).fetchone():
+            return signature
+        with db:
+            begin_write(db)
+            rows = [dict(r) for r in db.execute(f"SELECT o.shop_id,o.order_id,o.amount FROM orders o {join} WHERE {stale}",(signature,))]
+            items = defaultdict(list)
+            for item in db.execute(f"""SELECT i.shop_id,i.order_id,i.line_no,i.sku,i.quantity,i.unit_price,i.total_discount FROM order_items i JOIN orders o
+                ON o.shop_id=i.shop_id AND o.order_id=i.order_id {join}
+                WHERE {stale} ORDER BY i.shop_id,i.order_id,i.line_no""",(signature,)):
+                items[(item["shop_id"],item["order_id"])].append(dict(item))
+            updates = [{"shop_id":o["shop_id"],"order_id":o["order_id"],
+                        "price_eligible":int(evaluate_price(o,items[(o["shop_id"],o["order_id"])],rules)["eligible"]),
+                        "rules_hash":signature,"updated_at":now_iso()} for o in rows]
+            for start in range(0,len(updates),500):
+                upsert_many(db,"app_order_prices",updates[start:start+500],["shop_id","order_id"],
+                            ["price_eligible","rules_hash","updated_at"])
+        return signature
+
+    def _orders_from_db(self,db,*,include_excluded=True,rules=None,passing_only=False):
+        rules = rules if rules is not None else self.get_rules(db)
+        # UI assessment only needs these contact fields, not the complete POS JSON.
+        columns = ",".join(f"o.{col}" for col in ("shop_id","order_id","customer_key","status","source",
+            "amount","amount_source","created_at","updated_at","status_at","update_date","date_run","synced_at"))
+        projection = columns+",json_object('bill_full_name',json_extract(o.raw_json,'$.bill_full_name')," \
+            "'bill_phone_number',json_extract(o.raw_json,'$.bill_phone_number')) AS raw_json"
+        item_columns = "i.shop_id,i.order_id,i.line_no,i.sku,i.quantity,i.unit_price,i.total_discount"
+        if passing_only:
+            signature = self._ensure_price_index(db,rules)
+            price_join = "JOIN app_order_prices p ON p.shop_id=o.shop_id AND p.order_id=o.order_id"
+            condition = "p.price_eligible=1 AND p.rules_hash=?"
+            params = (signature,)
+            order_sql = f"SELECT {projection} FROM orders o {price_join} WHERE {condition} ORDER BY o.update_date DESC,o.order_id DESC"
+            contact_sql = f"SELECT c.* FROM customers c WHERE EXISTS (SELECT 1 FROM orders o {price_join} WHERE o.customer_key=c.customer_key AND {condition})"
+            item_sql = f"""SELECT {item_columns} FROM order_items i JOIN orders o ON o.shop_id=i.shop_id AND o.order_id=i.order_id
+                {price_join} WHERE {condition} ORDER BY i.shop_id,i.order_id,i.line_no"""
+        else:
+            params = ()
+            order_sql = f"SELECT {projection} FROM orders o ORDER BY o.update_date DESC,o.order_id DESC"
+            contact_sql = "SELECT * FROM customers"
+            item_sql = f"SELECT {item_columns} FROM order_items i ORDER BY i.shop_id,i.order_id,i.line_no"
+        # Fetch each relation once, instead of 3-5 remote queries per order.
+        contacts = {r["customer_key"]:dict(r) for r in db.execute(contact_sql,params)}
+        items_by_order = defaultdict(list)
+        for item in db.execute(item_sql,params):
+            items_by_order[(item["shop_id"],item["order_id"])].append(dict(item))
+        states_by_username = defaultdict(set)
+        for message in db.execute("SELECT username,state FROM messages"):
+            states_by_username[message["username"].casefold()].add(message["state"])
+        message_status = {user:self._message_status(states) for user,states in states_by_username.items()}
+        opt_out_hashes = {r[0] for r in db.execute("SELECT digest FROM app_opt_out_hash")}
+        secret = bytes.fromhex(db.execute("SELECT value FROM app_meta WHERE `key`='secret'").fetchone()[0]) if opt_out_hashes else None
+        today = today_vn()
+        rows,denied_users = [],{}
+        for order in db.execute(order_sql,params):
+            s = self._snapshot(db,order,contacts=contacts,items_by_order=items_by_order)
+            user = s["username"].casefold() if s["username"] else ""
+            if user not in denied_users:
+                denied_users[user] = bool(user and secret and hmac.new(secret,user.encode("utf-8"),hashlib.sha256).hexdigest() in opt_out_hashes)
+            assessment = self.assess(db,s,rules=rules,today=today,denied=denied_users[user])
+            if not include_excluded and not assessment["eligible"]:
+                continue
+            rows.append({"shop_id":order["shop_id"],"order_id":order["order_id"],
+                         "customer_key":order["customer_key"],"username":s["username"],
+                         "display_name":s["raw"].get("bill_full_name"),
+                         "phone":s["raw"].get("bill_phone_number"),"amount":order["amount"],
+                         "amount_source":order["amount_source"],"source":order["source"],
+                         "status":order["status"],"items":assessment["items"],
+                         "eligible":assessment["eligible"],"reason":assessment["reason"],
+                         "reason_label":assessment["reason_label"],"price_checks":assessment["price_checks"],
+                         "price_eligible":assessment["price_eligible"],
+                         "price_reason":assessment["price_reason"],
+                         "price_reason_label":assessment["price_reason_label"],
+                         "threshold_amount":assessment["threshold_amount"],
+                         "total_kg":assessment["total_kg"],"units_500g":assessment["units_500g"],
+                         "received_date":assessment["received_date"],"age_days":assessment["age_days"],
+                         "message_state":message_status.get(user,"not_sent"),
+                         "opted_out":bool(s["customer"] and s["customer"]["opted_out"])})
+        return rows
+
+    def customers(self, *, include_excluded=False, _orders=None, _profiles=None, passing_only=False):
+        if _orders is None:
+            with self.db() as db:
+                orders = self._orders_from_db(db,passing_only=passing_only)
+                profiles = self._profiles(db)
+        else:
+            orders,profiles = _orders,_profiles
         groups = {}
         for order in orders:
             key = self._profile_key(order)
@@ -535,9 +619,15 @@ class AppService:
                         "eligible_amount":0,"eligible_order_count":0}
         return sorted(groups.values(),key=lambda c: (-(c["age_days"] or 0),c["username"] is None,(c["username"] or "").casefold()))
 
-    def overview(self):
-        customers = [c for c in self.customers(include_excluded=True) if c["eligible"]]
-        orders = self.orders()
+    def overview(self, *, passing_only=False):
+        with self.db() as db:
+            orders = self._orders_from_db(db,passing_only=passing_only)
+            customers = self.customers(include_excluded=True,_orders=orders,_profiles=self._profiles(db))
+            return self._overview_from_data(orders,customers,schedule=self.get_schedule(db),
+                        active_job=self.active_job(db),sync=self.sync_state(db))
+
+    def _overview_from_data(self,orders,customers,*,schedule,active_job,sync):
+        customers = [c for c in customers if c["eligible"]]
         ages = Counter(c["age_days"] for c in customers if c["eligible"])
         states = Counter(c["message_state"] for c in customers)
         reasons = Counter(o["reason"] for o in orders if not o["eligible"])
@@ -547,25 +637,41 @@ class AppService:
                 "total_kg":sum(o["total_kg"] for c in customers for o in c["orders"] if o["eligible"]),
                 "day_zero":ages[0],"days":[{"day":day,"count":ages[day]} for day in range(1,16)],
                 "message_states":dict(states),"excluded":dict(reasons),
-                "schedule":self.get_schedule(),"browser":self.browser_state(),
-                "active_job":self.active_job(),"sync":self.sync_state()}
+                "schedule":schedule,"browser":self.browser_state(),
+                "active_job":active_job,"sync":sync}
 
-    def sync_state(self):
+    def dashboard_data(self):
+        """One connection and one order assessment pass for the entire dashboard."""
         with self.db() as db:
-            row = db.execute("""SELECT started_at,start_date,end_date,row_count,origin FROM sync_runs
+            rules = self.get_rules(db)
+            orders = self._orders_from_db(db,rules=rules,passing_only=True)
+            customers = self.customers(include_excluded=True,_orders=orders,_profiles=self._profiles(db))
+            schedule = self.get_schedule(db)
+            overview = self._overview_from_data(orders,customers,schedule=schedule,
+                            active_job=self.active_job(db),sync=self.sync_state(db))
+            return {"overview":overview,"customers":customers,"rules":rules,"schedule":schedule,
+                    "messages":self.messages(db=db),"jobs":self.jobs(db=db)}
+
+    def sync_state(self,db=None):
+        if db is None:
+            with self.db() as conn:
+                return self.sync_state(conn)
+        row = db.execute("""SELECT started_at,start_date,end_date,row_count,origin FROM sync_runs
                 WHERE origin IN ('app_api','app_auto') ORDER BY id DESC LIMIT 1""").fetchone()
         return {"last_run":dict(row) if row else None,"auto_error":self.auto_sync_error,
                 "automatic":self.auto_sync_enabled}
 
-    def active_job(self):
-        with self.db() as db:
-            row = db.execute("SELECT * FROM app_jobs WHERE state IN ('queued','running') ORDER BY id DESC LIMIT 1").fetchone()
-            return dict(row) if row else None
+    def active_job(self,db=None):
+        if db is None:
+            with self.db() as conn:
+                return self.active_job(conn)
+        row = db.execute("SELECT * FROM app_jobs WHERE state IN ('queued','running') ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
 
     def preview(self, batch_size=10, usernames=None, min_day=1, max_day=15):
         self._require_admin()
         selected = {username.casefold() for username in usernames} if usernames is not None else None
-        customers = [c for c in self.customers() if c["eligible"] and c["message_state"] in {"not_sent","pending"}
+        customers = [c for c in self.customers(passing_only=True) if c["eligible"] and c["message_state"] in {"not_sent","pending"}
                      and c["username"] and min_day <= c["age_days"] <= max_day
                      and (selected is None or c["username"].casefold() in selected)]
         customers = customers[:batch_size]
@@ -626,9 +732,9 @@ class AppService:
                     reason = assessment["reason"]
                 reasons[reason] += 1
                 if (normalized["status"] == 3 and normalized["source"] == "Tiktok"
-                        and age is not None and 0 <= age <= 15) or str(raw["id"]) in existing:
+                        and age is not None and 0 <= age <= 15 and assessment["eligible"]) or str(raw["id"]) in existing:
                     retained.append(raw)
-            saved = ingest_orders(db,retained,shop_id,start,end,origin=origin)
+            saved = ingest_orders(db,retained,shop_id,start,end,origin=origin,price_rules=rules)
         deleted = self.purge_expired()
         return {"fetched":len(incoming),"saved":saved,"reasons":dict(reasons),"purged":deleted}
 
@@ -637,7 +743,7 @@ class AppService:
         covered = set()
         with self.db() as db:
             runs = db.execute("""SELECT start_date,end_date,started_at FROM sync_runs
-                WHERE origin IN ('app_api','app_auto') ORDER BY id DESC""").fetchall()
+                WHERE origin IN ('app_api','app_auto') AND end_date>=? ORDER BY id DESC""",(first.isoformat(),)).fetchall()
         for run in runs:
             try:
                 start,end = date.fromisoformat(run["start_date"]),date.fromisoformat(run["end_date"])
@@ -663,6 +769,8 @@ class AppService:
     def _auto_sync_if_due(self):
         if not self.auto_sync_enabled or time.monotonic() < self._next_auto_sync_at:
             return
+        # A covered window should not reopen a remote connection every second.
+        self._next_auto_sync_at = time.monotonic()+60
         window = self._auto_sync_window(today_vn())
         if window is None or self._sync_lock.locked():
             return
@@ -678,24 +786,22 @@ class AppService:
         if self._job_thread and self._job_thread.is_alive():
             return 0  # Leave any active message intact; retry on next scheduler pass.
         today = today or today_vn()
-        deleted = 0
+        expired = []
         with self._job_lock,self.db() as db,db:
             if self._job_thread and self._job_thread.is_alive():
                 return 0
             begin_write(db)
             profiles = self._profiles(db)
             protected = {key for profile in profiles.values() for key in profile["customer_keys"]}
-            for row in db.execute("SELECT * FROM orders").fetchall():
-                if self._order_has_active_message(db,row["shop_id"],row["order_id"]):
+            active = {(r["shop_id"],r["order_id"]) for r in db.execute("SELECT DISTINCT shop_id,order_id FROM messages WHERE state IN ('sending','uncertain')")}
+            contacts = {r["customer_key"]:dict(r) for r in db.execute("SELECT * FROM customers")}
+            for row in db.execute("SELECT shop_id,order_id,customer_key,status,update_date,raw_json FROM orders"):
+                if (row["shop_id"],row["order_id"]) in active or row["customer_key"] in protected:
                     continue
-                snapshot = self._snapshot(db,row)
-                key = self._profile_key({**dict(row),"username":snapshot["username"]})
-                if row["customer_key"] in protected or key in profiles:
-                    continue
-                raw = json.loads(row["raw_json"])
-                status_history = raw.get("status_history") or []
                 receipt_date = row["update_date"] if row["status"] == 3 else None
                 if not receipt_date:
+                    raw = json.loads(row["raw_json"])
+                    status_history = raw.get("status_history") or []
                     for event in reversed(status_history):
                         if isinstance(event,dict) and str(event.get("status")) == "3":
                             from hong_core import api_datetime
@@ -711,11 +817,15 @@ class AppService:
                     continue
                 if age <= 15:
                     continue
-                self._delete_order(db,row["shop_id"],row["order_id"])
-                deleted += 1
-            self._clean_orphan_customers(db)
+                contact = contacts.get(row["customer_key"])
+                user = resolved_username(contact,row) if contact else username_candidate(json.loads(row["raw_json"]).get("bill_full_name"))
+                if self._profile_key({**dict(row),"username":user}) in profiles:
+                    continue
+                expired.append((row["shop_id"],row["order_id"]))
+            self._delete_orders(db,expired)
+            self._clean_orphan_customers(db,profiles)
         self._last_purge = time.monotonic()
-        return deleted
+        return len(expired)
 
     @staticmethod
     def _order_has_active_message(db,shop_id,order_id):
@@ -799,13 +909,17 @@ class AppService:
                 schedule["last_error"] = "Đợt gửi gặp lỗi. Hãy kiểm tra lịch sử trước khi bật lại."
                 db.execute("UPDATE app_schedule SET payload=? WHERE id=1",(json.dumps(schedule,ensure_ascii=False),))
 
-    def jobs(self, limit=30):
-        with self.db() as db:
-            return [dict(r) for r in db.execute("SELECT * FROM app_jobs ORDER BY id DESC LIMIT ?",(limit,))]
+    def jobs(self, limit=30, *, db=None):
+        if db is None:
+            with self.db() as conn:
+                return self.jobs(limit,db=conn)
+        return [dict(r) for r in db.execute("SELECT * FROM app_jobs ORDER BY id DESC LIMIT ?",(limit,))]
 
-    def messages(self, limit=200):
-        with self.db() as db:
-            return [dict(r) for r in db.execute("""SELECT m.*,o.amount,o.update_date FROM messages m
+    def messages(self, limit=200, *, db=None):
+        if db is None:
+            with self.db() as conn:
+                return self.messages(limit,db=conn)
+        return [dict(r) for r in db.execute("""SELECT m.*,o.amount,o.update_date FROM messages m
                 JOIN orders o ON o.shop_id=m.shop_id AND o.order_id=m.order_id
                 ORDER BY m.id DESC LIMIT ?""",(limit,))]
 
@@ -824,6 +938,9 @@ class AppService:
                 self._auto_sync_if_due()
                 if self.mode == "web":
                     continue
+                if time.monotonic() < self._next_schedule_poll:
+                    continue
+                self._next_schedule_poll = time.monotonic()+5
                 schedule = self.get_schedule()
                 due = schedule["enabled"] and schedule["next_run_at"] and iso_utc(schedule["next_run_at"]) <= datetime.now(UTC)
                 if not due:

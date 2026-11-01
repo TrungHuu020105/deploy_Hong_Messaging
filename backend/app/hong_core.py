@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from hong_database import (MySQLConnection, begin_write, concat_sql, insert_if_absent,
                            json_present_sql, load_environment, upsert)
+from backend.domain import evaluate_price, price_rules_hash
 
 ROOT = Path(__file__).resolve().parent
 VN = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -138,6 +139,13 @@ CREATE TABLE IF NOT EXISTS order_items (
  PRIMARY KEY(shop_id, order_id, line_no),
  FOREIGN KEY(shop_id,order_id) REFERENCES orders(shop_id,order_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS app_order_prices (
+ shop_id TEXT NOT NULL,order_id TEXT NOT NULL,price_eligible INTEGER NOT NULL,
+ rules_hash TEXT NOT NULL,updated_at TEXT NOT NULL,
+ PRIMARY KEY(shop_id,order_id),
+ FOREIGN KEY(shop_id,order_id) REFERENCES orders(shop_id,order_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_order_prices_eligible ON app_order_prices(price_eligible,rules_hash);
 CREATE TABLE IF NOT EXISTS sync_run_orders (
  sync_run_id INTEGER NOT NULL, shop_id TEXT NOT NULL, order_id TEXT NOT NULL,
  position INTEGER NOT NULL,
@@ -300,12 +308,14 @@ def normalize_order(order, shop_id):
             "raw_json": dump(order), "synced_at": now_iso(), "history": history}
 
 
-def ingest_orders(db, orders, shop_id, start, end, *, origin="api"):
+def ingest_orders(db, orders, shop_id, start, end, *, origin="api", price_rules=None):
     """Atomic upsert. Preserve verified contact choices and opt-outs on sync."""
     with db:
         begin_write(db)
         deleted = {r[0] for r in db.execute("SELECT order_id FROM app_deleted_orders WHERE shop_id=?",(str(shop_id),))}
         normalized = [(o, normalize_order(o, shop_id)) for o in orders if str(o.get("id")) not in deleted]
+        rules = price_rules or {}
+        rules_hash = price_rules_hash(rules)
         for raw, o in normalized:
             upsert(db,"customers",{**{col:o[col] for col in
                 ("customer_key","shop_id","display_name","phone","username_candidate")},"updated_at":o["synced_at"]},
@@ -315,6 +325,7 @@ def ingest_orders(db, orders, shop_id, start, end, *, origin="api"):
             upsert(db,"orders",{col:o[col] for col in cols},["shop_id","order_id"],list(cols[2:]))
             for table in ("order_items", "status_events"):
                 db.execute(f"DELETE FROM {table} WHERE shop_id=? AND order_id=?", (str(shop_id), o["order_id"]))
+            price_items = []
             for i, item in enumerate(raw.get("items") or []):
                 if not isinstance(item, dict):
                     raise ValueError("Dòng sản phẩm trong phản hồi API không phải đối tượng JSON; hủy thay đổi của đợt đồng bộ.")
@@ -326,10 +337,17 @@ def ingest_orders(db, orders, shop_id, start, end, *, origin="api"):
                            (str(shop_id),o["order_id"],i,variation.get("display_id") or variation.get("product_display_id") or item.get("sku"),
                             product_name,number(item.get("quantity")),number(item.get("price")),
                             number(item.get("total_discount")),dump(item)))
+                price_items.append({"sku":variation.get("display_id") or variation.get("product_display_id") or item.get("sku"),
+                    "quantity":number(item.get("quantity")),"unit_price":number(item.get("price")),
+                    "total_discount":number(item.get("total_discount")),"line_no":i})
             for i, event in enumerate(o["history"]):
                 db.execute("INSERT INTO status_events VALUES (?,?,?,?,?,?)",
                            (str(shop_id),o["order_id"],i,as_status(event.get("status")),
                             api_datetime(event.get("updated_at")),dump(event)))
+            price = evaluate_price(o,price_items,rules)
+            upsert(db,"app_order_prices",{"shop_id":str(shop_id),"order_id":o["order_id"],
+                "price_eligible":int(price["eligible"]),"rules_hash":rules_hash,"updated_at":o["synced_at"]},
+                ["shop_id","order_id"],["price_eligible","rules_hash","updated_at"])
         cursor = db.execute("INSERT INTO sync_runs(shop_id,started_at,start_date,end_date,row_count,origin) VALUES (?,?,?,?,?,?)",
                             (str(shop_id),now_iso(),str(start),str(end),len(normalized),origin))
         db.executemany("INSERT INTO sync_run_orders VALUES (?,?,?,?)",
@@ -421,6 +439,7 @@ def refresh_business_fields(db):
             if values != tuple(row[k] for k in ("status","status_at","update_date","amount","amount_source")):
                 db.execute("UPDATE orders SET status=?,status_at=?,update_date=?,amount=?,amount_source=? WHERE shop_id=? AND order_id=?",
                            (*values,row["shop_id"],row["order_id"]))
+                db.execute("DELETE FROM app_order_prices WHERE shop_id=? AND order_id=?",(row["shop_id"],row["order_id"]))
                 changed += 1
     return changed
 

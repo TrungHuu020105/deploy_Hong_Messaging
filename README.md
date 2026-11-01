@@ -2,12 +2,14 @@
 
 Thư mục này tạo bản web riêng cho VPS, dùng cùng MySQL với máy local:
 
-- Xem tổng quan, khách hàng, đơn và lịch sử.
+- Xem tổng quan, khách hàng và các đơn đạt giá; lịch sử gửi được giữ để đối chiếu.
 - Mọi người truy cập đều được gắn/gỡ thẻ, lưu hồ sơ, xóa đơn và đồng bộ đơn thủ công.
 - Đồng bộ Pancake tự động; giữ quy tắc khách có thẻ không bị dọn sau 15 ngày.
 - Không có gửi tin, lịch gửi, điều khiển Chrome hoặc đối chiếu gửi. Các API này cũng bị chặn.
 
 Mặc định mọi người được xem và chỉnh sửa công khai, không cần đăng nhập hoặc mã quản trị. Gắn thẻ/xóa đơn vẫn cần nhấn **Lưu thay đổi** mới ghi dữ liệu.
+
+Trang tải dữ liệu qua một API `/api/dashboard` dùng chung một lượt đọc theo lô. Bảng `app_order_prices` giúp lọc đơn đạt giá ngay trong SQL, và tự bổ sung kết quả cho dữ liệu cũ ở lần tải đầu sau nâng cấp. Dữ liệu POS gốc vẫn được giữ trong database; API không chuyển toàn bộ JSON gốc về giao diện. Tác vụ dọn đơn chạy nền, không giữ bước khởi động HTTP chờ quét từng đơn.
 
 ## 1. Chuẩn bị trên máy local
 

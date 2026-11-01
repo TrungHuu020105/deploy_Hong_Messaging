@@ -109,6 +109,15 @@ def tier_for(weight, mode="floor"):
     return max((n for n in TIERS if Decimal(n) <= weight), default=1)
 
 
+def price_rules_hash(rules):
+    import hashlib
+    import json
+    normalized = {"prices":PRICE_TABLE,"packaging":["HN","HG","TZ"],
+        "packaging_multipliers":{"HN":1,"HG":1.1,"TZ":1.1},"tier_mode":"floor",
+        "match_mode":"all","exclude_mixed":True,**rules}
+    return hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":" )).encode()).hexdigest()
+
+
 def evaluate_price(order, items, rules):
     """Strictly greater, never >=. Mixed products never borrow the entire order total."""
     parts = expand_items(items)

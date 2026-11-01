@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS order_items (
  PRIMARY KEY(shop_id,order_id,line_no),
  FOREIGN KEY(shop_id,order_id) REFERENCES orders(shop_id,order_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+CREATE TABLE IF NOT EXISTS app_order_prices (
+ shop_id VARCHAR(64) NOT NULL, order_id VARCHAR(128) NOT NULL, price_eligible INT NOT NULL,
+ rules_hash VARCHAR(64) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+ PRIMARY KEY(shop_id,order_id), INDEX idx_order_prices_eligible(price_eligible,rules_hash),
+ FOREIGN KEY(shop_id,order_id) REFERENCES orders(shop_id,order_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 CREATE TABLE IF NOT EXISTS sync_run_orders (
  sync_run_id BIGINT NOT NULL, shop_id VARCHAR(64) NOT NULL, order_id VARCHAR(128) NOT NULL, position INT NOT NULL,
  PRIMARY KEY(sync_run_id,shop_id,order_id), FOREIGN KEY(sync_run_id) REFERENCES sync_runs(id),
